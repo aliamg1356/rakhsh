@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# rakhsh — interactive installer / control panel.
-# Set up either end of the tunnel, hand the other end a one-line setup link,
-# add a proxy core (Iranian sites direct, the rest through the tunnel), run the
-# web panel, tune the kernel, watch status, and tear it all down again.
+# rakhsh — interactive multi-instance installer / control panel.
+# Run several independent tunnels on one host. Each instance gets its own
+# config, systemd unit and forwarded ports; the Iranian IP list is shared.
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/CluvexStudio/rakhsh/main/install.sh)
 #   sudo ./install.sh
-#   sudo ./install.sh --join rakhsh://…      join straight from a setup link
-#
-# Binaries: found if already present (installed, next to this script, or a local
-# cargo build under target/), otherwise downloaded from the GitHub release.
-# Override with  RAKHSH_BIN=/path  /  RAKHSH_CONTROL_BIN=/path,
-# or point elsewhere with  RAKHSH_REPO=owner/repo  RAKHSH_VERSION=v0.1.0
+#   sudo ./install.sh --join <name> rakhsh://…    join as a named instance
+#   sudo ./install.sh --panel                     set up / manage the web panel
 set -u
 
 GH_REPO="${RAKHSH_REPO:-CluvexStudio/rakhsh}"
@@ -33,12 +28,10 @@ warn(){ printf "  ${YEL}△${R} %s\n" "$*"; }
 die(){  printf "\n  ${RED}${DOWN} %s${R}\n\n" "$*"; exit 1; }
 rule(){ printf "  ${GRY}╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌${R}\n"; }
 
-# Scratch space. Fixed /tmp paths in a root script are a symlink waiting to happen.
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/rakhsh-install.XXXXXX") || { echo "cannot create a temp dir"; exit 1; }
 chmod 700 "$TMPD"
 trap 'rm -rf "$TMPD"' EXIT INT TERM
 
-# A pending node that resolves to online / offline.
 step(){ # step "label" cmd...
   local label="$1"; shift
   printf "  ${CYN}◌${R} %s" "$label"
@@ -61,17 +54,10 @@ banner(){
   printf "\n"
 }
 
-ask(){ # ask "prompt" default varname
-  local v; read -rp "  ${CYN}${EDGE}${R} $1 [$2]: " v; printf -v "$3" '%s' "${v:-$2}"
-}
-yesno(){ # yesno "prompt" y|n  -> 0 = yes
-  local v; read -rp "  ${CYN}${EDGE}${R} $1 [$2]: " v; v=${v:-$2}
-  case "$v" in y|Y|yes|YES) return 0;; *) return 1;; esac
-}
+ask(){ local v; read -rp "  ${CYN}${EDGE}${R} $1 [$2]: " v; printf -v "$3" '%s' "${v:-$2}"; }
+yesno(){ local v; read -rp "  ${CYN}${EDGE}${R} $1 [$2]: " v; v=${v:-$2}; case "$v" in y|Y|yes|YES) return 0;; *) return 1;; esac; }
 
 # ─────────────────────────────── env ─────────────────────────────────
-# $EUID is a bash builtin: it works even where `id`/`whoami` are disabled
-# (some hosting images neuter them).
 case "${1:-}" in -h|--help) ;; *) [ "${EUID:-1}" -eq 0 ] || die "run as root (sudo $0)";; esac
 
 ARCH=$(uname -m 2>/dev/null); case "$ARCH" in ""|*isabled*) ARCH="${HOSTTYPE:-x86_64}";; esac
@@ -86,12 +72,72 @@ pubip(){
 }
 PUBIP=$(pubip)
 
+# ─────────────────────────── paths / instances ───────────────────────
 CFGDIR=/etc/rakhsh
-CFG=$CFGDIR/config.toml        # the tunnel      (service: rakhsh)
-NODECFG=$CFGDIR/node.toml      # standalone node (service: rakhsh-node)
-CTLCFG=$CFGDIR/control.toml    # the web panel   (service: rakhsh-control)
-IRLIST=$CFGDIR/iran.txt
+IRLIST=$CFGDIR/iran.txt          # shared by every instance
+CTLCFG=$CFGDIR/control.toml      # the web panel (service: rakhsh-control)
 LINK_PREFIX="rakhsh://"
+
+# Per-instance state. Set by instance_paths().
+INSTANCE=""
+CFG=""; NODECFG=""; SVC=""
+instance_paths(){ # instance_paths <name>
+  INSTANCE="$1"
+  CFG="$CFGDIR/$INSTANCE.toml"
+  NODECFG="$CFGDIR/$INSTANCE-node.toml"
+  SVC="rakhsh-$INSTANCE"
+}
+list_instances(){ # print every configured tunnel instance name
+  local f
+  for f in "$CFGDIR"/*.toml; do
+    [ -e "$f" ] || continue
+    local n; n=$(basename "$f" .toml)
+    case "$n" in control|*-node) continue;; esac
+    printf '%s\n' "$n"
+  done | sort -V
+}
+list_node_instances(){
+  local f
+  for f in "$CFGDIR"/*-node.toml; do
+    [ -e "$f" ] || continue
+    basename "$f" | sed 's/-node\.toml$//'
+  done | sort -V
+}
+next_instance_name(){ # pick a free name like t1, t2, ...
+  local i=1
+  while [ -e "$CFGDIR/t$i.toml" ] || [ -e "$CFGDIR/t$i-node.toml" ]; do i=$((i+1)); done
+  echo "t$i"
+}
+next_free_port(){ # next_free_port <base>
+  local p="${1:-7000}" i
+  while :; do
+    if ! ss -lnt 2>/dev/null | grep -qE ":${p} "; then echo "$p"; return; fi
+    p=$((p+1)); [ $p -gt 65535 ] && { echo 7000; return; }
+  done
+}
+validate_name(){ case "$1" in ''|*[!a-zA-Z0-9_-]*) return 1;; *) return 0;; esac; }
+
+pick_instance(){ # pick_instance [prompt]
+  local prompt="${1:-instance name}"
+  local def; def=$(next_instance_name)
+  ask "$prompt" "$def" INSTANCE
+  validate_name "$INSTANCE" || die "invalid instance name: $INSTANCE (use letters, digits, _ or -)"
+  instance_paths "$INSTANCE"
+}
+choose_existing_instance(){ # choose_existing_instance <what>  → sets INSTANCE/CFG/SVC
+  local what="$1" names
+  names=$(list_instances)
+  [ -n "$names" ] || return 1
+  if [ "$(printf '%s\n' "$names" | wc -l)" = 1 ]; then
+    instance_paths "$names"; return 0
+  fi
+  printf "\n  existing instances:\n"
+  local n
+  for n in $names; do printf "    ${CYN}•${R} %s\n" "$n"; done
+  ask "which instance" "$(printf '%s\n' "$names" | head -1)" INSTANCE
+  instance_paths "$INSTANCE"
+  [ -f "$CFG" ] || { bad "no such instance: $INSTANCE"; return 1; }
+}
 
 BIN="${RAKHSH_BIN:-}"
 locate_bin(){
@@ -107,20 +153,15 @@ locate_bin(){
     "$(command -v rakhsh 2>/dev/null || true)"
   )
   local c
-  for c in "${cands[@]}"; do
-    if [ -n "$c" ] && [ -x "$c" ]; then BIN="$c"; return 0; fi
-  done
+  for c in "${cands[@]}"; do [ -n "$c" ] && [ -x "$c" ] && { BIN="$c"; return 0; }; done
   return 1
 }
-# ─────────────────────────── fetching binaries ───────────────────────
-dl(){ # dl <url> <dest>
-  if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 --max-time 180 -o "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then wget -q --tries=3 -O "$2" "$1"
-  else return 1; fi
-}
 
-# Map what the kernel calls this machine onto the release asset built for it.
-# The right-hand side has to match the target matrix in .github/workflows/release.yml.
+# ─────────────────────────── fetching binaries ───────────────────────
+dl(){ if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 --max-time 180 -o "$2" "$1"
+      elif command -v wget >/dev/null 2>&1; then wget -q --tries=3 -O "$2" "$1"
+      else return 1; fi; }
+
 gh_arch(){
   case "$ARCH" in
     x86_64|amd64)           echo x86_64-unknown-linux-musl;;
@@ -134,11 +175,8 @@ gh_arch(){
     *) return 1;;
   esac
 }
-
 RUST_TARGET=$(gh_arch 2>/dev/null) || RUST_TARGET="${ARCH}-unknown-linux-musl"
 
-# Download one release asset to /usr/local/bin, checking its sha256 when the
-# release publishes one.
 fetch_release(){ # fetch_release <binary name>
   local name="$1" tgt base asset out sum
   tgt=$(gh_arch) || { bad "no prebuilt binary for ${B}$ARCH${R}"; return 1; }
@@ -153,7 +191,6 @@ fetch_release(){ # fetch_release <binary name>
   if ! dl "$base/$asset" "$out"; then
     printf "\r  ${RED}${DOWN}${R} downloading %s\n" "$name"
     info "no release asset at ${B}$base/$asset${R}"
-    info "if the repository is private, the download needs a token — build locally instead"
     return 1
   fi
   if dl "$base/$asset.sha256" "$out.sha256" 2>/dev/null; then
@@ -174,13 +211,12 @@ ensure_bin(){
   if ! locate_bin; then
     info "rakhsh binary not found on this host"
     if yesno "download it from github.com/$GH_REPO?" y; then
-      if fetch_release rakhsh; then BIN=/usr/local/bin/rakhsh; fi
+      fetch_release rakhsh && BIN=/usr/local/bin/rakhsh
     fi
   fi
   if ! locate_bin; then
     bad "no rakhsh binary."
     info "build it:  ${B}cargo zigbuild --release --target ${RUST_TARGET}${R}"
-    info "then re-run from the project dir — it auto-finds ${B}target/.../release/rakhsh${R}"
     info "or copy it to ${B}/usr/local/bin/rakhsh${R}, or run ${B}sudo RAKHSH_BIN=/real/path ./install.sh${R}"
     die "need the binary to continue"
   fi
@@ -204,9 +240,7 @@ locate_ctl(){
     "$(command -v rakhsh-control 2>/dev/null || true)"
   )
   local c
-  for c in "${cands[@]}"; do
-    if [ -n "$c" ] && [ -x "$c" ]; then CTLBIN="$c"; return 0; fi
-  done
+  for c in "${cands[@]}"; do [ -n "$c" ] && [ -x "$c" ] && { CTLBIN="$c"; return 0; }; done
   return 1
 }
 ensure_ctl(){
@@ -218,8 +252,6 @@ ensure_ctl(){
   fi
   if ! locate_ctl; then
     bad "no rakhsh-control binary."
-    info "build it:  ${B}cargo build --release -p rakhsh-control${R}  (in control/)"
-    info "or copy it to ${B}/usr/local/bin/rakhsh-control${R}, or run with ${B}RAKHSH_CONTROL_BIN=/real/path${R}"
     return 1
   fi
   if [ "$CTLBIN" != /usr/local/bin/rakhsh-control ]; then
@@ -228,10 +260,9 @@ ensure_ctl(){
   return 0
 }
 
-# Read one top-level "key = \"value\"" out of a TOML file.
 toml_get(){ sed -n "s/^$2 *= *\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | head -1; }
 
-panel_creds(){ # panel_creds  — print the URL, username and password of an installed panel
+panel_creds(){
   local listen user pass host port
   listen=$(toml_get "$CTLCFG" listen); user=$(toml_get "$CTLCFG" username); pass=$(toml_get "$CTLCFG" password)
   port=${listen##*:}; host=${listen%:*}
@@ -246,17 +277,22 @@ panel_creds(){ # panel_creds  — print the URL, username and password of an ins
   fi
 }
 
-# Point the panel's first [[node]] at the service on this host. Only the FIRST
-# commented unit/config_path: the ones below belong to the commented-out example
-# node, and uncommenting those duplicates the keys and breaks the TOML.
-wire_node(){ # wire_node <unit> <config path>
-  sed -i "0,/^# unit = /s|^# unit = .*|unit = \"$1\"|" "$CTLCFG"
-  sed -i "0,/^# config_path = /s|^# config_path = .*|config_path = \"$2\"|" "$CTLCFG"
+# Append a [[node]] block for an instance to the panel config (idempotent).
+wire_node(){ # wire_node <instance> <svc> <config path>
+  local name="$1" svc="$2" path="$3"
+  [ -f "$CTLCFG" ] || return 0
+  grep -q "unit = \"$svc\"" "$CTLCFG" && return 0
+  cat >>"$CTLCFG" <<EOF
+
+[[node]]
+name = "$name"
+unit = "$svc"
+config_path = "$path"
+EOF
 }
 
 svc_exists(){ [ -f "/etc/systemd/system/$1.service" ]; }
 
-# Print the proxy endpoints found in the first [[inbound]] of a config.
 proxy_info(){ # proxy_info <cfgfile>
   local f="$1"; [ -f "$f" ] || return 0
   local blk listen user pass host port cred=""
@@ -285,6 +321,8 @@ create_tunnel(){
   banner
   printf "  ${B}Create a new tunnel${R}  ${GRY}(run this on the server the other side will reach)${R}\n\n"
   rule
+  pick_instance "instance name (t1, t2, …)"
+  printf "  ${GRY}this tunnel will live at ${B}$CFG${R} ${GRY}as ${B}$SVC.service${R}\n\n" "$GRY" "$R" "$GRY" "$R"
 
   if [ -f "$CFG" ]; then
     yesno "$CFG already exists — replace it? (a .bak copy is kept)" n || return 0
@@ -308,36 +346,34 @@ create_tunnel(){
   case "$c" in 2) carrier=quicv2;; 3) carrier=tls;; 4) carrier=kcp;; 5) carrier=tcp;; *) carrier=wss;; esac
   case "$carrier" in wss|tls|ws) ask "SNI / fake host" www.bing.com sni;; esac
 
-  printf "\n  Fallback carriers ${GRY}(optional: if the main carrier is blocked the tunnel moves to these by itself and back, see cluvexstudio.dev/rakhsh/docs/guide/links)${R}\n"
-  printf "    any of ${B}quicv2 kcp tcp tls wss${R}, space-separated; ${B}CARRIER:PORT${R} for its own port (a TCP carrier can't reuse the tunnel's TCP port).\n"
-  printf "    ${GRY}e.g.  quicv2 kcp${R}   — press Enter for none\n"
+  printf "\n  Fallback carriers ${GRY}(optional, space-separated; ${B}CARRIER:PORT${R} for its own port)${R}\n"
   ask "fallbacks" "" links_in
   local link_args=() l
   for l in $links_in; do link_args+=(--link "$l"); done
 
-  printf "\n  Data protection ${GRY}(what the tunnel does to your bytes once connected — both ends get the same setting):${R}\n"
+  printf "\n  Data protection:\n"
   printf "    ${CYN}1${R}) ${B}full${R}  ${GRY}AES-256-GCM on every byte ${GRN}(recommended)${R}\n"
-  printf "    ${CYN}2${R}) ${B}none${R}  ${GRY}no protection after the handshake — fastest; only if your traffic is already encrypted end to end${R}\n"
+  printf "    ${CYN}2${R}) ${B}none${R}  ${GRY}fastest; only if traffic is already end-to-end encrypted${R}\n"
   ask "choice" 1 e
   case "$e" in 2) enc=none;; *) enc=full;; esac
-  case "$enc" in
-    none) warn "encryption=none: both ends are still authenticated, but data on the wire is unprotected — it can be read and altered. Use it only for traffic that is already encrypted end to end." ;;
-  esac
+  [ "$enc" = none ] && warn "encryption=none: both ends authenticated, but data on the wire is unprotected."
 
-  printf "\n  Stream resumption ${GRY}(optional — when a lane drops, connections move to another lane and go on instead of being reset; both ends get it; costs some memory, see RESUME.md)${R}\n"
+  printf "\n  Stream resumption ${GRY}(optional — keep connections alive across lane drops)${R}\n"
   local resume_args=()
   yesno "keep connections alive across lane drops?" n && resume_args=(--resume)
 
   printf "\n  Tunnel mode:\n"
-  printf "    ${CYN}1${R}) reverse  ${GRY}exit dials the entry ${GRN}(default — entry has a public port)${R}\n"
+  printf "    ${CYN}1${R}) reverse  ${GRY}exit dials the entry ${GRN}(default)${R}\n"
   printf "    ${CYN}2${R}) direct   ${GRY}entry dials the exit${R}\n"
   ask "choice" 1 m
   [ "$m" = 2 ] && { direct=1; dir="--direct"; }
 
   local listen_role; [ "$direct" = 1 ] && listen_role="exit" || listen_role="entry"
   local def_ip="1.2.3.4"; [ "$role" = "$listen_role" ] && def_ip="${PUBIP:-1.2.3.4}"
+  # Default port is auto-picked so several instances don't collide.
+  local def_port; def_port=$(next_free_port 7000)
   printf "\n  Public address of the ${B}${listen_role}${R} (what the other end dials):\n"
-  ask "address" "${def_ip}:7000" addr
+  ask "address" "${def_ip}:${def_port}" addr
 
   printf "\n  Forwarded ports (blank to finish): ${B}listen=target${R}, e.g. 0.0.0.0:443=127.0.0.1:8443 — add ${B}/udp${R} for UDP.\n"
   local fwd_args=() f
@@ -347,10 +383,11 @@ create_tunnel(){
   done
   [ ${#fwd_args[@]} -eq 0 ] && info "no forwards — fine if you only use the proxy core below"
 
-  printf "\n  ${B}Core${R} ${GRY}an optional SOCKS5+HTTP proxy on the entry. It can send Iranian sites straight out\n  of Iran and everything else through the tunnel.${R}\n"
+  printf "\n  ${B}Core${R} ${GRY}an optional SOCKS5+HTTP proxy on the entry.${R}\n"
   local proxy_args=() plisten
   if yesno "expose a proxy on the entry?" n; then
-    ask "proxy listen address (0.0.0.0:1080 shares it; a login is generated)" 127.0.0.1:1080 plisten
+    local pdef; pdef="127.0.0.1:$(next_free_port 1080)"
+    ask "proxy listen address (a login is generated)" "$pdef" plisten
     proxy_args=(--proxy "$plisten")
     yesno "Iranian sites direct, everything else via the tunnel?" y && proxy_args+=(--split-iran)
   fi
@@ -371,36 +408,51 @@ create_tunnel(){
 
   mkdir -p "$CFGDIR"
   cp "$mine" "$CFG"; chmod 600 "$CFG"
-  ok "wrote this server's config → $CFG  (role=${B}$role${R}, carrier=${B}$carrier${R}, encryption=${B}$enc${R})"
+  ok "wrote $INSTANCE config → $CFG  (role=${B}$role${R}, carrier=${B}$carrier${R}, encryption=${B}$enc${R})"
   step "validating the config" "$BIN" check -c "$CFG" || die "generated config failed validation"
 
   grep -q 'rule_file' "$CFG" && build_iran_list
-  step "installing systemd service (rakhsh.service)" "$BIN" install -c "$CFG" --name rakhsh
+  step "installing systemd service ($SVC.service)" "$BIN" install -c "$CFG" --name "$SVC"
+
+  # Wire the panel to this new instance if a panel is installed.
+  if [ -f "$CTLCFG" ] && svc_exists rakhsh-control; then
+    wire_node "$INSTANCE" "$SVC" "$CFG"
+    step "adding $INSTANCE to the control panel" systemctl restart rakhsh-control \
+      && ok "panel now tracks $SVC" || warn "panel restart failed — add the node manually in $CTLCFG"
+  fi
 
   local link; link="${LINK_PREFIX}$(base64 -w0 < "$other" 2>/dev/null || base64 < "$other" | tr -d '\n')"
   rm -f "$TMPD/rk_e.toml" "$TMPD/rk_x.toml"
   [ "$role" = entry ] && proxy_info "$CFG"
   printf "\n"; rule
-  printf "\n  ${GRN}${B}Tunnel is up on this side.${R}  Now set up the ${B}${other_role}${R} server:\n\n"
+  printf "\n  ${GRN}${B}Tunnel $INSTANCE is up on this side.${R}  Now set up the ${B}${other_role}${R} server:\n\n"
   printf "    paste this one line into it — nothing else to answer:\n\n"
-  printf "  ${YEL}bash <(curl -fsSL https://raw.githubusercontent.com/%s/main/install.sh) --join %s${R}\n\n" "$GH_REPO" "$link"
-  # shellcheck disable=SC1111 # the typographic quotes are deliberate in output
-  printf "    ${GRY}or run the installer there and choose “Join with a setup link”, then paste:${R}\n\n"
+  printf "  ${YEL}bash <(curl -fsSL https://raw.githubusercontent.com/%s/main/install.sh) --join %s %s${R}\n\n" "$GH_REPO" "$INSTANCE" "$link"
+  printf "    ${GRY}or run the installer there, choose “Join with a setup link”, pick a name, then paste:${R}\n\n"
   printf "  ${GRY}%s${R}\n\n" "$link"
-  [ "$role" = exit ] && [ ${#proxy_args[@]} -gt 0 ] && info "the proxy lives on the entry — its endpoints (and login) are shown after you join there"
+  [ "$role" = exit ] && [ ${#proxy_args[@]} -gt 0 ] && info "the proxy lives on the entry — its endpoints are shown after you join there"
   info "the link carries the other end's keys + settings — treat it like a password."
   rule
 }
 
-join_link(){ # join_link [link]
+join_link(){ # join_link [name] [link]
   banner
   printf "  ${B}Join with a setup link${R}\n\n"
-  local link="${1:-}"
+  local name="${1:-}" link="${2:-}"
+
+  if [ -n "$name" ]; then
+    validate_name "$name" || die "invalid instance name: $name"
+    instance_paths "$name"
+  else
+    pick_instance "instance name for this side (t1, t2, …)"
+  fi
+
   [ -z "$link" ] && read -rp "  ${CYN}${EDGE}${R} paste rakhsh:// link: " link
   [ -z "$link" ] && die "no link"
   local b64="${link#${LINK_PREFIX}}"
   local cfg; cfg=$(printf '%s' "$b64" | base64 -d 2>/dev/null) || die "bad link (base64 decode failed)"
   printf '%s' "$cfg" | grep -q 'role *=' || die "bad link (not a rakhsh config)"
+
   if [ -f "$CFG" ]; then
     yesno "$CFG already exists — replace it? (a .bak copy is kept)" n || return 0
     cp "$CFG" "$CFG.bak"
@@ -411,25 +463,34 @@ join_link(){ # join_link [link]
   ok "decoded config → $CFG (role=${B}$role${R})"
   step "validating the config" "$BIN" check -c "$CFG" || die "link config failed validation"
   grep -q 'rule_file' "$CFG" && build_iran_list
-  step "installing systemd service (rakhsh.service)" "$BIN" install -c "$CFG" --name rakhsh
+  step "installing systemd service ($SVC.service)" "$BIN" install -c "$CFG" --name "$SVC"
+
+  if [ -f "$CTLCFG" ] && svc_exists rakhsh-control; then
+    wire_node "$INSTANCE" "$SVC" "$CFG"
+    systemctl restart rakhsh-control >/dev/null 2>&1 && ok "panel now tracks $SVC" || warn "panel restart failed"
+  fi
+
   proxy_info "$CFG"
-  printf "\n  ${GRN}${B}Joined.${R} Both ends should now connect.\n"
+  printf "\n  ${GRN}${B}Joined $INSTANCE.${R} Both ends should now connect.\n"
 }
 
 create_node(){
   banner
   printf "  ${B}Proxy node${R}  ${GRY}standalone SOCKS5+HTTP proxy, direct out, no tunnel${R}\n\n"
   rule; printf "\n"
+  pick_instance "node name (t1, t2, …)"
+  local NODESVC="rakhsh-node-$INSTANCE"
   if [ -f "$NODECFG" ]; then
     yesno "$NODECFG already exists — replace it? (a .bak copy is kept)" n || return 0
     cp "$NODECFG" "$NODECFG.bak"
   fi
-  local plisten; ask "listen address (0.0.0.0:1080 shares it; a login is generated)" 127.0.0.1:1080 plisten
+  local plisten pdef; pdef="127.0.0.1:$(next_free_port 1080)"
+  ask "listen address (a login is generated)" "$pdef" plisten
   mkdir -p "$CFGDIR"
   "$BIN" init-node --listen "$plisten" > "$NODECFG" || die "init-node failed"
   chmod 600 "$NODECFG"
   step "validating the config" "$BIN" check -c "$NODECFG" || die "node config failed validation"
-  step "installing systemd service (rakhsh-node.service)" "$BIN" install -c "$NODECFG" --name rakhsh-node
+  step "installing systemd service ($NODESVC.service)" "$BIN" install -c "$NODECFG" --name "$NODESVC"
   proxy_info "$NODECFG"
 }
 
@@ -452,11 +513,22 @@ create_panel(){
       ok "password changed"
       panel_creds
     fi
+    if yesno "wire all existing instances to the panel now?" y; then
+      local n
+      for n in $(list_instances); do
+        wire_node "$n" "rakhsh-$n" "$CFGDIR/$n.toml"
+        ok "wired $n"
+      done
+      for n in $(list_node_instances); do
+        wire_node "$n-node" "rakhsh-node-$n" "$CFGDIR/$n-node.toml"
+        ok "wired node $n"
+      done
+      systemctl restart rakhsh-control >/dev/null 2>&1 && ok "panel restarted"
+    fi
     return 0
   fi
 
-  local port
-  ask "panel port" 8443 port
+  local port; ask "panel port" "$(next_free_port 8443)" port
   case "$port" in ''|*[!0-9]*) die "not a port: $port";; esac
 
   mkdir -p "$CFGDIR"
@@ -464,15 +536,15 @@ create_panel(){
     || { sed 's/^/      /' "$TMPD/err"; die "rakhsh-control init failed"; }
   ok "generated $CTLCFG with a random username and password"
 
-  if [ -f "$CFG" ]; then
-    wire_node rakhsh "$CFG"
-    ok "wired the panel to this node's rakhsh.service"
-  elif [ -f "$NODECFG" ]; then
-    wire_node rakhsh-node "$NODECFG"
-    ok "wired the panel to this node's rakhsh-node.service"
-  else
-    warn "no rakhsh config on this host yet — the panel will show an empty fleet until you create one"
-  fi
+  # Wire every existing instance automatically.
+  local n any=0
+  for n in $(list_instances); do
+    wire_node "$n" "rakhsh-$n" "$CFGDIR/$n.toml"; ok "wired $n"; any=1
+  done
+  for n in $(list_node_instances); do
+    wire_node "$n-node" "rakhsh-node-$n" "$CFGDIR/$n-node.toml"; ok "wired node $n"; any=1
+  done
+  [ $any = 0 ] && warn "no rakhsh config on this host yet — the panel will show an empty fleet"
   chmod 600 "$CTLCFG"
 
   step "installing systemd service (rakhsh-control.service)" \
@@ -484,19 +556,41 @@ create_panel(){
   info "add more nodes by editing ${B}$CTLCFG${R}, then: ${B}systemctl restart rakhsh-control${R}"
 }
 
+list_services(){ # list_services — pretty print all instances
+  banner; printf "  ${B}Instances${R}\n\n"
+  local any=0 n act
+  for n in $(list_instances); do
+    any=1
+    local svc="rakhsh-$n" cfg="$CFGDIR/$n.toml"
+    act=$(systemctl is-active "$svc" 2>/dev/null)
+    if [ "$act" = active ]; then ok "$svc ${GRN}active${R}  ($cfg)"; else bad "$svc ${RED}${act:-not installed}${R}  ($cfg)"; fi
+  done
+  for n in $(list_node_instances); do
+    any=1
+    local svc="rakhsh-node-$n" cfg="$CFGDIR/$n-node.toml"
+    act=$(systemctl is-active "$svc" 2>/dev/null)
+    if [ "$act" = active ]; then ok "$svc ${GRN}active${R}  ($cfg)"; else bad "$svc ${RED}${act:-not installed}${R}  ($cfg)"; fi
+  done
+  [ $any = 0 ] && warn "nothing installed yet"
+  printf "\n"
+}
+
 update_list(){
-  banner; printf "  ${B}Iranian IP list${R}  ${GRY}(for split routing: Iranian sites direct)${R}\n\n"
+  banner; printf "  ${B}Iranian IP list${R}  ${GRY}(shared by all instances)${R}\n\n"
   build_iran_list
-  local s
-  for s in rakhsh rakhsh-node; do
-    if svc_exists "$s" && systemctl is-active --quiet "$s"; then
-      step "restarting $s to load the new list" systemctl restart "$s"
-    fi
+  local s n
+  for n in $(list_instances); do
+    s="rakhsh-$n"
+    svc_exists "$s" && systemctl is-active --quiet "$s" && step "restarting $s to load the new list" systemctl restart "$s"
+  done
+  for n in $(list_node_instances); do
+    s="rakhsh-node-$n"
+    svc_exists "$s" && systemctl is-active --quiet "$s" && step "restarting $s to load the new list" systemctl restart "$s"
   done
 }
 
 do_optimize(){
-  banner; printf "  ${B}Kernel network tuning${R}  ${GRY}(BBR + fq, buffers, backlog)${R}\n\n"
+  banner; printf "  ${B}Kernel network tuning${R}  ${GRY}(BBR + fq, buffers, backlog) — host-wide${R}\n\n"
   step "applying sysctl tunables" "$BIN" optimize
   ok "persisted to /etc/sysctl.d/99-rakhsh.conf"
 }
@@ -506,23 +600,29 @@ show_status(){
   printf "  ${GRY}host${R}   %s ${GRY}·${R} %s ${GRY}·${R} %s CPUs ${GRY}·${R} public IP ${B}%s${R}\n" "$ARCH" "$OS" "$CPUS" "${PUBIP:-?}"
   printf "  ${GRY}binary${R} %s  %s\n" "$BIN" "$("$BIN" --version 2>/dev/null)"
   rule
-  local s cfg any=0
-  for s in rakhsh rakhsh-node; do
-    svc_exists "$s" || continue
+  local any=0 n act cfg
+  for n in $(list_instances); do
     any=1
-    cfg=$CFG; [ "$s" = rakhsh-node ] && cfg=$NODECFG
-    local act; act=$(systemctl is-active "$s" 2>/dev/null)
-    if [ "$act" = active ]; then ok "$s.service ${GRN}active${R}"; else bad "$s.service ${RED}$act${R}"; fi
-    [ -f "$cfg" ] && info "config $cfg — role $(grep -oP 'role *= *"\K[^"]+' "$cfg" 2>/dev/null), carrier $(grep -oP 'carrier *= *"\K[^"]+' "$cfg" 2>/dev/null || echo tcp)"
-    printf "  ${GRY}recent log:${R}\n"
-    journalctl -u "$s" --no-pager -n 5 2>/dev/null | sed 's/^/    /' | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-150
+    cfg="$CFGDIR/$n.toml"
+    act=$(systemctl is-active "rakhsh-$n" 2>/dev/null)
+    if [ "$act" = active ]; then ok "rakhsh-$n.service ${GRN}active${R}"; else bad "rakhsh-$n.service ${RED}${act:-missing}${R}"; fi
+    [ -f "$cfg" ] && info "$n — role $(grep -oP 'role *= *"\K[^"]+' "$cfg" 2>/dev/null), carrier $(grep -oP 'carrier *= *"\K[^"]+' "$cfg" 2>/dev/null || echo tcp)"
+    journalctl -u "rakhsh-$n" --no-pager -n 3 2>/dev/null | sed 's/^/    /' | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-140
+    proxy_info "$cfg"
+    printf "\n"
+  done
+  for n in $(list_node_instances); do
+    any=1
+    cfg="$CFGDIR/$n-node.toml"
+    act=$(systemctl is-active "rakhsh-node-$n" 2>/dev/null)
+    if [ "$act" = active ]; then ok "rakhsh-node-$n.service ${GRN}active${R}"; else bad "rakhsh-node-$n.service ${RED}${act:-missing}${R}"; fi
     proxy_info "$cfg"
     printf "\n"
   done
   if svc_exists rakhsh-control; then
     any=1
-    local pact; pact=$(systemctl is-active rakhsh-control 2>/dev/null)
-    if [ "$pact" = active ]; then ok "rakhsh-control.service ${GRN}active${R}"; else bad "rakhsh-control.service ${RED}$pact${R}"; fi
+    act=$(systemctl is-active rakhsh-control 2>/dev/null)
+    if [ "$act" = active ]; then ok "rakhsh-control.service ${GRN}active${R}"; else bad "rakhsh-control.service ${RED}${act:-missing}${R}"; fi
     [ -f "$CTLCFG" ] && panel_creds
     printf "\n"
   fi
@@ -532,32 +632,68 @@ show_status(){
 
 do_uninstall(){
   banner; printf "  ${B}Uninstall${R}\n\n"
-  local s any=0
-  for s in rakhsh rakhsh-node; do
-    svc_exists "$s" || continue
-    any=1
-    if yesno "remove $s.service and its config?" n; then
-      "$BIN" uninstall --name "$s" >/dev/null 2>&1
-      if [ "$s" = rakhsh ]; then rm -f "$CFG" "$CFG.bak"; else rm -f "$NODECFG" "$NODECFG.bak"; fi
-      ok "$s removed"
-    else
-      info "$s kept"
-    fi
-  done
-  if svc_exists rakhsh-control; then
-    any=1
-    if yesno "remove rakhsh-control.service and its config?" n; then
-      if locate_ctl; then "$CTLBIN" uninstall --name rakhsh-control >/dev/null 2>&1; else
-        systemctl disable --now rakhsh-control >/dev/null 2>&1
-        rm -f /etc/systemd/system/rakhsh-control.service; systemctl daemon-reload
-      fi
-      rm -f "$CTLCFG"
-      ok "rakhsh-control removed"
-    else
-      info "rakhsh-control kept"
-    fi
+  local names; names=$(list_instances)
+  local nodenames; nodenames=$(list_node_instances)
+  if [ -z "$names" ] && [ -z "$nodenames" ] && ! svc_exists rakhsh-control; then
+    info "no rakhsh services installed"; return 0
   fi
-  [ $any = 0 ] && info "no rakhsh services installed"
+
+  printf "  what to remove?\n"
+  printf "    ${CYN}1${R}) one specific tunnel instance\n"
+  printf "    ${CYN}2${R}) one specific proxy node\n"
+  printf "    ${CYN}3${R}) the web panel\n"
+  printf "    ${CYN}4${R}) ${RED}everything${R}\n"
+  printf "    ${CYN}0${R}) back\n"
+  local x; ask "choice" 0 x
+  case "$x" in
+    1)
+      [ -n "$names" ] || { info "no tunnels"; return 0; }
+      choose_existing_instance tunnel || return 0
+      if yesno "remove $SVC.service and $CFG?" n; then
+        "$BIN" uninstall --name "$SVC" >/dev/null 2>&1 || { systemctl disable --now "$SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/$SVC.service"; systemctl daemon-reload; }
+        rm -f "$CFG" "$CFG.bak"
+        ok "$INSTANCE removed"
+      fi;;
+    2)
+      [ -n "$nodenames" ] || { info "no proxy nodes"; return 0; }
+      local defn; defn=$(printf '%s\n' "$nodenames" | head -1)
+      local n; ask "node name" "$defn" n
+      local svc="rakhsh-node-$n" cfg="$CFGDIR/$n-node.toml"
+      if yesno "remove $svc.service and $cfg?" n; then
+        "$BIN" uninstall --name "$svc" >/dev/null 2>&1 || { systemctl disable --now "$svc" >/dev/null 2>&1; rm -f "/etc/systemd/system/$svc.service"; systemctl daemon-reload; }
+        rm -f "$cfg" "$cfg.bak"; ok "node $n removed"
+      fi;;
+    3)
+      if svc_exists rakhsh-control && yesno "remove rakhsh-control.service and its config?" n; then
+        if locate_ctl; then "$CTLBIN" uninstall --name rakhsh-control >/dev/null 2>&1; else
+          systemctl disable --now rakhsh-control >/dev/null 2>&1
+          rm -f /etc/systemd/system/rakhsh-control.service; systemctl daemon-reload
+        fi
+        rm -f "$CTLCFG"; ok "rakhsh-control removed"
+      fi;;
+    4)
+      if ! yesno "${RED}really remove every rakhsh instance, node and the panel?${R}" n; then return 0; fi
+      local s
+      for s in $(list_instances); do
+        "$BIN" uninstall --name "rakhsh-$s" >/dev/null 2>&1
+        rm -f "$CFGDIR/$s.toml" "$CFGDIR/$s.toml.bak"
+        ok "rakhsh-$s removed"
+      done
+      for s in $(list_node_instances); do
+        "$BIN" uninstall --name "rakhsh-node-$s" >/dev/null 2>&1
+        rm -f "$CFGDIR/$s-node.toml" "$CFGDIR/$s-node.toml.bak"
+        ok "rakhsh-node-$s removed"
+      done
+      if svc_exists rakhsh-control; then
+        if locate_ctl; then "$CTLBIN" uninstall --name rakhsh-control >/dev/null 2>&1; else
+          systemctl disable --now rakhsh-control >/dev/null 2>&1
+          rm -f /etc/systemd/system/rakhsh-control.service; systemctl daemon-reload
+        fi
+        rm -f "$CTLCFG"; ok "rakhsh-control removed"
+      fi
+      rm -f "$IRLIST" 2>/dev/null;;
+    *) return 0;;
+  esac
   info "binary left at /usr/local/bin/rakhsh"
 }
 
@@ -566,9 +702,11 @@ case "${1:-}" in
   -h|--help)
     banner
     printf "  ${B}usage${R}\n\n"
-    printf "    sudo ./install.sh                  the menu\n"
-    printf "    sudo ./install.sh --join <link>    join straight from a rakhsh:// link\n"
-    printf "    sudo ./install.sh --panel          set up the web panel and print its login\n\n"
+    printf "    sudo ./install.sh                          the menu\n"
+    printf "    sudo ./install.sh --join <name> <link>     join as instance <name>\n"
+    printf "    sudo ./install.sh --join <link>            join (name picked automatically)\n"
+    printf "    sudo ./install.sh --panel                  set up the web panel\n"
+    printf "    sudo ./install.sh --list                   list instances and status\n\n"
     printf "  ${B}environment${R}\n\n"
     printf "    RAKHSH_BIN= / RAKHSH_CONTROL_BIN=  use these binaries\n"
     printf "    RAKHSH_REPO=owner/repo             download from another repository\n"
@@ -576,12 +714,12 @@ case "${1:-}" in
     exit 0;;
   --join)
     ensure_bin
-    join_link "${2:-}"
+    if [ -n "${3:-}" ]; then join_link "$2" "$3"; else join_link "" "${2:-}"; fi
     exit $?;;
   --panel)
-    ensure_bin
-    create_panel
-    exit $?;;
+    ensure_bin; create_panel; exit $?;;
+  --list)
+    ensure_bin; show_status; exit 0;;
   "") ;;
   *) die "unknown argument ${1}. Try --help";;
 esac
@@ -590,20 +728,25 @@ esac
 ensure_bin
 while :; do
   banner
-  printf "  ${GRN}${NODE}${R} ${GRY}this node${R}  ${D}%s · %s · %s CPUs · %s${R}\n\n" "$ARCH" "$OS" "$CPUS" "${PUBIP:-?}"
+  printf "  ${GRN}${NODE}${R} ${GRY}this node${R}  ${D}%s · %s · %s CPUs · %s${R}\n" "$ARCH" "$OS" "$CPUS" "${PUBIP:-?}"
+  local_inst=$(list_instances | wc -l 2>/dev/null || echo 0)
+  local_nodes=$(list_node_instances | wc -l 2>/dev/null || echo 0)
+  printf "  ${GRY}instances:${R} ${B}%s${R} ${GRY}tunnel(s),${R} ${B}%s${R} ${GRY}node(s)${R}\n\n" "$local_inst" "$local_nodes"
   printf "   ${WIRE}┌─${R} ${CYN}${HUB}${R} ${B}1${R}  ${B}Create a new tunnel${R}     ${GRY}wizard, proxy core, setup link${R}\n"
   printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}2${R}  ${B}Join with a setup link${R}  ${GRY}paste a link from the other node${R}\n"
   printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}3${R}  ${B}Proxy node${R}              ${GRY}standalone SOCKS5/HTTP, no tunnel${R}\n"
   printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}4${R}  ${B}Control panel${R}           ${GRY}web panel, with a generated login${R}\n"
-  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}5${R}  ${B}Update Iranian IP list${R}  ${GRY}for direct routing of Iranian sites${R}\n"
-  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}6${R}  ${B}Optimize kernel${R}         ${GRY}BBR + fq + buffers${R}\n"
-  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}7${R}  ${B}Status${R}\n"
-  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}8${R}  ${B}Uninstall${R}\n"
+  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}5${R}  ${B}List instances${R}          ${GRY}all tunnels & nodes on this host${R}\n"
+  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}6${R}  ${B}Update Iranian IP list${R}  ${GRY}shared by every instance${R}\n"
+  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}7${R}  ${B}Optimize kernel${R}         ${GRY}BBR + fq + buffers (host-wide)${R}\n"
+  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}8${R}  ${B}Status${R}\n"
+  printf "   ${WIRE}├─${R} ${CYN}${HUB}${R} ${B}9${R}  ${B}Uninstall${R}             ${GRY}a single instance, a node, the panel, or all${R}\n"
   printf "   ${WIRE}└─${R} ${GRY}${DOWN}${R} ${B}0${R}  ${GRY}Exit${R}\n\n"
   read -rp "  ${CYN}${EDGE}${R} select: " sel
   case "$sel" in
     1) create_tunnel;; 2) join_link;; 3) create_node;; 4) create_panel;;
-    5) update_list;; 6) do_optimize;; 7) show_status;; 8) do_uninstall;;
+    5) list_services;; 6) update_list;; 7) do_optimize;; 8) show_status;;
+    9) do_uninstall;;
     0|q|Q) printf "\n  ${GRY}bye.${R}\n\n"; exit 0;;
     *) continue;;
   esac
